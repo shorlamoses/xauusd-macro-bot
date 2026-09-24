@@ -11,7 +11,6 @@ from telegram_notifier import TelegramNotifier
 
 load_dotenv()
 
-# --- HEALTH SERVER FOR RENDER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -27,7 +26,6 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
     server.serve_forever()
 
-# --- GOLD SENTINEL WITH TRADE TRACKER & MARKET CALENDAR ---
 class GoldMarketSentinel:
     def __init__(self):
         self.compass = MacroCompass()
@@ -37,52 +35,39 @@ class GoldMarketSentinel:
         self.last_signal_key = None
         self.last_briefing_date = None
         self.last_summary_date = None
-        self.current_bias = None
-
-        # Daily Trade Ledger: Tracks outcomes of sent signals
+        self.last_core_direction = None
         self.daily_trades = []
 
     def is_market_open(self) -> tuple:
-        """
-        Enforces real-world market hours:
-        - Closed Friday 21:00 UTC through Sunday 21:00 UTC (Weekend)
-        - Closed during Daily Rollover (21:00 - 22:00 UTC)
-        """
         now_utc = datetime.now(timezone.utc)
-        weekday = now_utc.weekday()  # Monday=0, Sunday=6
+        weekday = now_utc.weekday()
         hour = now_utc.hour
 
-        # Friday after 21:00 UTC
         if weekday == 4 and hour >= 21:
-            return False, "Weekend (Friday Market Close)"
-        # Saturday all day
+            return False, "Weekend (Friday Close)"
         if weekday == 5:
-            return False, "Weekend (Market Closed)"
-        # Sunday before 21:00 UTC
+            return False, "Weekend (Saturday)"
         if weekday == 6 and hour < 21:
-            return False, "Weekend (Pre-Market Open)"
-        # Weekday daily rollover (spreads blow out)
+            return False, "Weekend (Sunday Pre-Open)"
         if hour == 21:
             return False, "Daily Bank Rollover Blackout"
 
         return True, "Market Open"
 
-    def get_session_poll_interval(self) -> int:
+    def is_high_liquidity_window(self) -> bool:
+        """Limits scans to London (07-11 UTC) and NY (12-16 UTC) to save API credits."""
         now_utc = datetime.now(timezone.utc)
         hour = now_utc.hour
-        # London (07:00-11:00 UTC) & NY (12:00-16:00 UTC)
-        if (7 <= hour < 11) or (12 <= hour < 16):
-            return 180  # 3 mins
-        return 300      # 5 mins
+        return (7 <= hour < 11) or (12 <= hour < 16)
 
     def update_trade_outcomes(self, current_candle: dict):
-        """Monitors live candles to check if open signals hit TP1, TP2, or SL."""
+        if not current_candle:
+            return
         high = current_candle["High"]
         low = current_candle["Low"]
 
         for trade in self.daily_trades:
             if trade["status"] == "OPEN":
-                # BUY TRADE MONITORING
                 if trade["direction"] == "BULLISH":
                     if low <= trade["sl"]:
                         trade["status"] = "HIT_SL"
@@ -90,8 +75,6 @@ class GoldMarketSentinel:
                         trade["status"] = "HIT_TP2"
                     elif high >= trade["tp1"]:
                         trade["status"] = "HIT_TP1"
-
-                # SELL TRADE MONITORING
                 elif trade["direction"] == "BEARISH":
                     if high >= trade["sl"]:
                         trade["status"] = "HIT_SL"
@@ -100,8 +83,25 @@ class GoldMarketSentinel:
                     elif low <= trade["tp1"]:
                         trade["status"] = "HIT_TP1"
 
+    def check_macro_shift(self, macro_report: dict):
+        score = macro_report.get("macro_score", 0)
+        direction = "BEARISH" if score <= -2.0 else ("BULLISH" if score >= 2.0 else "NEUTRAL")
+
+        if self.last_core_direction is None:
+            self.last_core_direction = direction
+            return
+
+        if direction != self.last_core_direction and direction != "NEUTRAL":
+            self.last_core_direction = direction
+            msg = (
+                f"🔄 <b>XAUUSD MACRO REGIME SHIFT</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>New Bias:</b> <b>{macro_report['macro_bias']}</b> ({score}/5)\n"
+                f"🎯 <b>Directive:</b> <code>{macro_report['trading_directive']}</code>"
+            )
+            self.notifier.send_message(msg)
+
     def send_daily_summary(self):
-        """Sends daily performance recap at 20:00 UTC (21:00 WAT)."""
         now_utc = datetime.now(timezone.utc)
         today = now_utc.date()
 
@@ -112,17 +112,13 @@ class GoldMarketSentinel:
                     f"📊 <b>XAUUSD DAILY RECAP ({today.strftime('%d %b')})</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"💤 <b>Signals Generated:</b> 0\n"
-                    f"<i>Market was in chop/consolidation. Zero forced trades. Capital preserved.</i>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━"
+                    f"<i>Market lacked institutional volume/trend. Zero forced trades. Capital safe.</i>"
                 )
             else:
                 tp1 = sum(1 for t in self.daily_trades if t["status"] in ["HIT_TP1", "HIT_TP2"])
                 tp2 = sum(1 for t in self.daily_trades if t["status"] == "HIT_TP2")
                 sl = sum(1 for t in self.daily_trades if t["status"] == "HIT_SL")
-                open_trades = sum(1 for t in self.daily_trades if t["status"] == "OPEN")
-
-                wins = tp1
-                win_rate = round((wins / total) * 100, 1) if total > 0 else 0.0
+                win_rate = round((tp1 / total) * 100, 1)
 
                 msg = (
                     f"📊 <b>XAUUSD DAILY PERFORMANCE RECAP</b>\n"
@@ -132,47 +128,38 @@ class GoldMarketSentinel:
                     f"✅ <b>Hit Target 1:</b> {tp1}\n"
                     f"🏆 <b>Hit Target 2:</b> {tp2}\n"
                     f"❌ <b>Hit Stop Loss:</b> {sl}\n"
-                    f"⏳ <b>Active / Open:</b> {open_trades}\n"
                     f"📈 <b>Daily Win Rate:</b> <b>{win_rate}%</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⚡ <i>Gold Autonomous Journal</i>"
+                    f"━━━━━━━━━━━━━━━━━━━━"
                 )
-
             self.notifier.send_message(msg)
             self.last_summary_date = today
 
     def run_cycle(self):
         market_open, reason = self.is_market_open()
         if not market_open:
-            print(f"[{datetime.now(timezone.utc).strftime('%H:%M UTC')}] Standby: {reason}")
             return
 
         now_utc = datetime.now(timezone.utc)
 
-        # 1. Reset ledger at start of new day
         if self.last_briefing_date != now_utc.date():
             self.daily_trades = []
 
-        # 2. Check Macro Bias
+        # 1. Macro Bias
         macro_report = self.compass.calculate_macro_bias()
-        new_bias = macro_report["macro_bias"]
+        self.check_macro_shift(macro_report)
 
-        # Morning Briefing (07:30 WAT)
         if self.last_briefing_date != now_utc.date() and now_utc.hour >= 6:
             self.notifier.send_macro_briefing(macro_report)
             self.last_briefing_date = now_utc.date()
 
-        # 3. SMC Scan
+        # 2. SMC / Technical Scan (Single API call)
         smc_report = self.smc.scan_for_setups(macro_report)
         if smc_report.get("status") != "READY":
             return
 
-        df = self.smc.fetch_data(interval="15min", outputsize=5)
-        if not df.empty:
-            curr_candle = {"High": df["High"].iloc[-1], "Low": df["Low"].iloc[-1]}
-            self.update_trade_outcomes(curr_candle)
+        # Updates trade outcomes using candle already returned (saves 1 API call!)
+        self.update_trade_outcomes(smc_report.get("candle"))
 
-        # 4. Check Setup
         setup = smc_report.get("active_setup")
         if setup:
             setup_key = f"{setup['signal']}_{setup['entry_zone']}"
@@ -181,7 +168,6 @@ class GoldMarketSentinel:
                 self.notifier.send_trade_alert(setup, macro_report)
                 self.last_signal_key = setup_key
 
-                # Record in Daily Ledger
                 try:
                     entry_val = float(str(setup["entry_zone"]).replace("$", "").strip())
                     self.daily_trades.append({
@@ -194,21 +180,21 @@ class GoldMarketSentinel:
                         "time": now_utc.strftime("%H:%M")
                     })
                 except Exception as e:
-                    print(f"[Ledger Record Error]: {e}")
+                    print(f"[Ledger Error]: {e}")
 
-        # 5. Check Daily Performance Summary dispatch (21:00 WAT)
         self.send_daily_summary()
 
     def start(self):
-        print("🪙 Autonomous Gold Sentinel Active with Live Trade Journal")
+        print("🪙 Autonomous Gold Sentinel Active (Optimized API Allocation)")
         while True:
             try:
                 self.run_cycle()
             except Exception as e:
-                print(f"[Cycle Error]: {e}")
+                print(f"[Gold Sentinel Exception]: {e}")
 
+            # Sleep 5 minutes (300s) during session, 15 minutes off-session
             market_open, _ = self.is_market_open()
-            sleep_time = self.get_session_poll_interval() if market_open else 900  # 15 mins on weekends
+            sleep_time = 300 if (market_open and self.is_high_liquidity_window()) else 900
             time.sleep(sleep_time)
 
 if __name__ == "__main__":

@@ -48,18 +48,21 @@ st.divider()
 # 2. SMC Section (Crash-Proof)
 st.subheader("🎯 2. Trend & Setup Blueprint")
 if smc_report.get("status") == "READY":
-    levels = smc_report["levels"]
-    curr_price = levels["current_price"]
-    pdh_val = levels.get("pdh", levels["asian_high"])
-    pdl_val = levels.get("pdl", levels["asian_low"])
+    levels = smc_report.get("levels", {})
+    curr_price = levels.get("current_price", 0.0)
+    pdh_val = levels.get("pdh", levels.get("asian_high", 0.0))
+    pdl_val = levels.get("pdl", levels.get("asian_low", 0.0))
+
+    setup = smc_report.get("active_setup")
+    # Defensively handle NoneType setup to avoid AttributeError
+    atr_display = setup.get("atr", "Active") if isinstance(setup, dict) else "Active"
 
     l1, l2, l3, l4 = st.columns(4)
     l1.metric("Spot Gold", f"${curr_price}")
-    l2.metric("Asian Range", f"${levels['asian_low']} - ${levels['asian_high']}")
+    l2.metric("Asian Range", f"${levels.get('asian_low', 0)} - ${levels.get('asian_high', 0)}")
     l3.metric("Prev Day Range", f"${pdl_val} - ${pdh_val}")
-    l4.metric("Market Volatility", f"ATR: {smc_report.get('active_setup', {}).get('atr', 'Normal')}")
+    l4.metric("Market Volatility", f"ATR: {atr_display}")
 
-    setup = smc_report.get("active_setup")
     if setup:
         st.success(f"### 🚨 SETUP TRIGGERED: {setup['signal']}")
         c1, c2, c3, c4 = st.columns(4)
